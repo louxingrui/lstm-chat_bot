@@ -1,0 +1,190 @@
+import torch
+import copy
+import pickle
+import numpy as np
+import torch.nn.functional as F
+from transformers import top_k_top_p_filtering
+from nltk import ngrams
+
+def evaluate_ppl(model, dataloder, tokenizer):
+    """ Evaluate perplexity on dev sentences
+    @param model (NMT): NMT Model
+    @param dev_data (list of (src_sent, tgt_sent)): list of tuples containing source and target sentence
+    @param batch_size (batch size)
+    @returns ppl (perplixty on dev sentences)
+    """
+    was_training = model.training
+    model.eval()
+
+    cum_loss = 0.
+    cum_tgt_words = 0.
+
+    # no_grad() signals backend to throw away all gradients
+    with torch.no_grad():
+        for idx, batch in enumerate(dataloder):
+            labels = batch["target_ids"]
+            # when cal loss, ignore <pad>
+            labels[labels[:, :] == tokenizer.pad_token_id] = -100
+
+            outputs = model(
+                input_ids=batch["source_ids"],
+                attention_mask=batch["source_mask"],
+                labels=labels,
+                decoder_attention_mask=batch['target_mask']
+            )
+
+            loss = outputs[0]
+
+            # loss = -model(src_sents, tgt_sents).sum()
+
+            cum_loss += loss.item()
+            tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
+            cum_tgt_words += tgt_word_num_to_predict
+
+        ppl = torch.exp(cum_loss / cum_tgt_words)
+
+    if was_training:
+        model.train()
+    return ppl
+
+def init_para_frompretrained(m, pm, share_para=False):
+    m.shared.weight = pm.embed_tokens.weight
+
+    for i in range(min(len(m.encoder.block), len(pm.block))):
+        # layer[0].SelfAttention
+        m.encoder.block[i].layer[0].SelfAttention.q.weight = pm.block[i].layer[0].SelfAttention.q.weight if share_para else copy.copy(pm.block[i].layer[0].SelfAttention.q.weight)
+        m.encoder.block[i].layer[0].SelfAttention.k.weight = pm.block[i].layer[0].SelfAttention.k.weight if share_para else copy.copy(pm.block[i].layer[0].SelfAttention.k.weight)
+        m.encoder.block[i].layer[0].SelfAttention.v.weight = pm.block[i].layer[0].SelfAttention.v.weight if share_para else copy.copy(pm.block[i].layer[0].SelfAttention.v.weight)
+        m.encoder.block[i].layer[0].SelfAttention.o.weight = pm.block[i].layer[0].SelfAttention.o.weight if share_para else copy.copy(pm.block[i].layer[0].SelfAttention.o.weight)
+        if i == 0:
+            m.encoder.block[i].layer[0].SelfAttention.relative_attention_bias.weight = pm.block[i].layer[0].SelfAttention.relative_attention_bias.weight if share_para else copy.copy(pm.block[i].layer[0].SelfAttention.relative_attention_bias.weight)
+        # layer[1].Dense
+        m.encoder.block[i].layer[1].DenseReluDense.wi_0.weight = pm.block[i].layer[1].DenseReluDense.wi_0.weight if share_para else copy.copy(pm.block[i].layer[1].DenseReluDense.wi_0.weight)
+        m.encoder.block[i].layer[1].DenseReluDense.wi_1.weight = pm.block[i].layer[1].DenseReluDense.wi_1.weight if share_para else copy.copy(pm.block[i].layer[1].DenseReluDense.wi_1.weight)
+        m.encoder.block[i].layer[1].DenseReluDense.wo.weight = pm.block[i].layer[1].DenseReluDense.wo.weight if share_para else copy.copy(pm.block[i].layer[1].DenseReluDense.wo.weight)
+
+def get_datasets(dataset_paths):
+    """Args:
+        dataset_paths: {'train': str, 'valid': str, 'test': str}
+    """
+    datasets = {}
+
+    for split, fname in dataset_paths.items():
+        f = open(fname, 'rb')
+        datasets[split] = pickle.load(f)
+
+    return datasets
+
+def sample_sequence(model,
+                    prefix_batch,
+                    prefix_length,
+                    continuation_length,
+                    num_samples=1,
+                    top_k=0,
+                    top_p=0.0,
+                    temperature=1.0,
+                    repetition_penalty=1.0,
+                    device=None, **kwargs):
+    batch_size = prefix_batch.size(0)
+    prev = torch.tensor([[0]] * batch_size, dtype=torch.long, device=device)
+    output = prev
+
+    log_probs = torch.zeros((num_samples * prefix_batch.size(0), continuation_length))
+
+    policy_pis = []
+    continuation_logits = []
+    (prior_mean, prior_logvar), encoder_outputs = model.encoder(
+        input_ids=prefix_batch["source_ids"],
+        attention_mask=prefix_batch["source_mask"], )
+    latent_mean, latent_logvar = prior_mean, prior_logvar
+    z = model.reparameterize(latent_mean, latent_logvar)
+
+    for i in range(continuation_length):
+        decoder_outputs = model.decoder(
+            input_ids=prev,
+            past_key_values=encoder_outputs.past_key_values,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=prefix_batch["source_mask"],
+            representations=z,
+        )
+        sequence_output = decoder_outputs[0]
+        logits = model.lm_head(sequence_output)
+        logits = logits[:, -1, :] / temperature
+
+        if repetition_penalty != 1.0:
+            for ex_id, pert_logits in enumerate(logits):
+                for token_idx in set(output[ex_id].tolist()):
+                    if pert_logits[token_idx] < 0:
+                        pert_logits[token_idx] *= repetition_penalty
+                    else:
+                        pert_logits[token_idx] /= repetition_penalty
+
+        if top_k == 1 and top_p == 0:   #greedy search
+            filtered_logits = logits
+            prev = logits.float().argmax(dim=1, keepdim=True)
+        else:
+            filtered_logits = top_k_top_p_filtering(
+                logits, top_k=top_k, top_p=top_p)
+            prev = F.softmax(filtered_logits,dim=-1).multinomial(num_samples=1) # sample
+
+        #log_prob = F.log_softmax(filtered_logits, dim=-1)
+        log_prob = F.log_softmax(logits, dim=-1)
+
+
+        continuation_logits.append(logits)
+        output = torch.cat((output, prev), dim=1)
+
+        arange = np.arange(filtered_logits.size(0))
+        next_token_logit = filtered_logits[arange,
+                                           prev.squeeze().tolist()].squeeze()
+
+        next_token_log_prob = log_prob[arange,
+                                       prev.squeeze().tolist()].squeeze()
+        log_probs[:, i] = next_token_log_prob
+        policy_pis.append(log_prob.squeeze())
+
+    policy_pis = torch.stack(policy_pis, 1)
+    continuation_logits = torch.stack(continuation_logits, 1)
+
+    result = (output, log_probs, continuation_logits, policy_pis)
+    return result
+
+def get_text_continuation(bpe_completion, tokenizer, args):
+    completion = tokenizer.decode(bpe_completion)
+    bpe_prefix, bpe_continuation = bpe_completion[:
+                                                  args.prefix_length], bpe_completion[args.prefix_length:]
+    prefix = tokenizer.decode(bpe_prefix)
+
+    if prefix in completion:
+        continuation = completion.replace(prefix, '')
+    else:
+        prefix_ = ' '.join(prefix.split(' ')[:-2])
+        continuation = completion.replace(prefix_, '')
+
+    continuation_tokens = tokenize(continuation)
+    return continuation_tokens
+
+def ngram_metrics(token_list, pad=1, n=None):
+    if pad in token_list:
+        # remove possible padding
+        token_list = token_list[:token_list.index(pad)]
+    stats = defaultdict(float)
+    if n is None:
+        for n in range(1, 5):
+            ngs = [ng for ng in ngrams(token_list, n)]
+            counter = Counter([ng for ng in ngrams(token_list, n)])
+            try:
+                stats[f'pct_repeat_{n}grams'] = 1.0 - len(counter) / len(ngs)
+            except BaseException:
+                stats[f'pct_repeat_{n}grams'] = 1.0
+                print('exception')
+    else:
+        ngs = [ng for ng in ngrams(token_list, n)]
+        counter = Counter([ng for ng in ngrams(token_list, n)])
+        try:
+            stats['pct_repeat_ngrams'] = 1.0 - len(counter) / len(ngs)
+        except BaseException:
+            stats['pct_repeat_ngrams'] = 1.0
+            print('exception')
+
+    return stats
