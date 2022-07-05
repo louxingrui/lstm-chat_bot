@@ -1,0 +1,40 @@
+import os, sys
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+
+
+# test: {'<Other>': 1694, '<Like>': 1670, '<Sadness>': 1456, '<Disgust>': 1610, '<Anger>': 1127, '<Happiness>': 1650}
+
+
+
+ours = [[1662, 16, 3, 10, 3, 0],
+        [20, 1569, 10, 16, 2, 26],
+        [3, 2, 1444, 3, 2, 2],
+        [18, 28, 18, 1479, 61, 6],
+        [4, 1, 6, 31, 1083, 2],
+        [0, 2, 5, 0, 0, 1643]]
+
+def main():
+    x_axis_labels = ['WMT', 'IT', 'KOR', 'LAW', 'MED', 'SUB']
+    y_axis_labels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+    # === plot ===
+    plt.figure(figsize=(4.4, 6))
+    plt.rcParams['font.size'] = 12
+    sns.heatmap(ours_random, xticklabels=x_axis_labels, yticklabels=y_axis_labels,
+        fmt='.20g', annot=True, cmap='Blues', cbar=False)
+
+    # plt.ylim(0, 3)
+    plt.xlabel('Ours-RS')
+    plt.ylabel('Distributions')
+    plt.subplots_adjust(top=0.98)
+    plt.subplots_adjust(bottom=0.1)
+    plt.subplots_adjust(right=0.95)
+    plt.show()
+    return 0
+
+if __name__ == '__main__':
+    main()
